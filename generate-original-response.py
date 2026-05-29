@@ -17,8 +17,7 @@ Each parquet has columns:
   example_idx       int32
 
 Run:
-    uv add datasets          # if not already installed
-    uv run python generate-original-response.py
+    python generate-original-response.py
 """
 # %%
 from __future__ import annotations
@@ -32,6 +31,7 @@ import pyarrow.parquet as pq
 import torch
 from datasets import load_dataset
 from transformers import AutoModelForCausalLM, AutoTokenizer
+
 # %%
 # ── Config ────────────────────────────────────────────────────────────────────
 MODEL_ID = "Qwen/Qwen2.5-7B-Instruct"
@@ -39,6 +39,14 @@ EXTRACT_LAYER = 20          # residual stream after transformer layer 20 (0-inde
 D_MODEL = 3584
 MAX_NEW_TOKENS = 512
 OUTPUT_DIR = Path("step1_activations")
+
+# Number of GSM8K test examples to process. None = all 1319.
+N_EXAMPLES: int | None = None
+
+# Batch size for forward + generate passes.
+# 4× RTX 3090 (24 GB each): Qwen2.5-7B-Instruct in bfloat16 ≈ 14 GB on one GPU,
+# leaving ~10 GB for KV cache + activations. Start at 8; raise to 16 if VRAM allows.
+BATCH_SIZE = 8
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 DTYPE = torch.bfloat16
@@ -66,7 +74,79 @@ def answers_match(response: str, gold: str) -> bool:
         return float(pred) == float(ref)
     except ValueError:
         return pred == ref
-# %%
+
+
+# ── Batch helpers ─────────────────────────────────────────────────────────────
+
+def build_prompts(tok: AutoTokenizer, questions: list[str]) -> list[str]:
+    return [
+        tok.apply_chat_template(
+            [{"role": "system", "content": SYSTEM_PROMPT},
+             {"role": "user", "content": q}],
+            tokenize=False,
+            add_generation_prompt=True,
+        )
+        for q in questions
+    ]
+
+
+def process_batch(
+    model: AutoModelForCausalLM,
+    tok: AutoTokenizer,
+    batch_examples: list[dict],
+    batch_indices: list[int],
+) -> list[dict]:
+    questions = [ex["question"] for ex in batch_examples]
+    golds = [ex["answer"] for ex in batch_examples]
+    prompts = build_prompts(tok, questions)
+
+    # Left-pad so all sequences end at the same position — last real token is always [:, -1, :].
+    enc = tok(prompts, return_tensors="pt", padding=True, truncation=False).to(DEVICE)
+    input_ids = enc["input_ids"]
+    attention_mask = enc["attention_mask"]
+    prompt_lens = attention_mask.sum(dim=1).tolist()  # actual (non-pad) lengths
+
+    # Pass 1: extract layer-20 residual stream at last prompt token.
+    # hidden_states[0] = embedding output; hidden_states[k+1] = layer-k output.
+    with torch.no_grad():
+        fwd = model(input_ids, attention_mask=attention_mask,
+                    output_hidden_states=True, use_cache=False)
+    # With left-padding the last real token is always at position -1.
+    act_vecs: np.ndarray = (
+        fwd.hidden_states[EXTRACT_LAYER + 1][:, -1, :]
+        .float()
+        .cpu()
+        .numpy()
+    )
+    del fwd
+
+    # Pass 2: generate responses.
+    with torch.no_grad():
+        out_ids = model.generate(
+            input_ids,
+            attention_mask=attention_mask,
+            max_new_tokens=MAX_NEW_TOKENS,
+            do_sample=False,
+            pad_token_id=tok.eos_token_id,
+        )
+
+    rows = []
+    for b, (question, gold, idx, act_vec, plen) in enumerate(
+        zip(questions, golds, batch_indices, act_vecs, prompt_lens)
+    ):
+        total_len = input_ids.shape[1]
+        # out_ids includes the (left-padded) prompt; skip it to get only new tokens.
+        response = tok.decode(out_ids[b, total_len:], skip_special_tokens=True)
+        rows.append({
+            "question": question,
+            "gold_answer": gold,
+            "model_response": response,
+            "is_correct": answers_match(response, gold),
+            "activation_vector": act_vec,
+            "example_idx": idx,
+        })
+    return rows
+
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 
@@ -75,9 +155,14 @@ def main() -> None:
 
     print(f"Loading {MODEL_ID}...")
     tok = AutoTokenizer.from_pretrained(MODEL_ID, trust_remote_code=True)
+    # Left-padding is required for batched generation with decoder-only models.
+    tok.padding_side = "left"
+    if tok.pad_token is None:
+        tok.pad_token = tok.eos_token
+
     model = AutoModelForCausalLM.from_pretrained(
         MODEL_ID,
-        dtype=DTYPE,
+        torch_dtype=DTYPE,
         device_map="auto",
         trust_remote_code=True,
     )
@@ -85,62 +170,28 @@ def main() -> None:
 
     print("Loading GSM8K test split...")
     ds = load_dataset("gsm8k", "main", split="test")
+    if N_EXAMPLES is not None:
+        ds = ds.select(range(min(N_EXAMPLES, len(ds))))
+    print(f"Processing {len(ds)} examples with batch_size={BATCH_SIZE}")
 
     correct_rows: list[dict] = []
     incorrect_rows: list[dict] = []
+    total_processed = 0
 
-    for i, ex in enumerate(ds):
-        question: str = ex["question"]
-        gold: str = ex["answer"]
+    for batch_start in range(0, len(ds), BATCH_SIZE):
+        batch_end = min(batch_start + BATCH_SIZE, len(ds))
+        batch_examples = [ds[i] for i in range(batch_start, batch_end)]
+        batch_indices = list(range(batch_start, batch_end))
 
-        messages = [
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": question},
-        ]
-        prompt = tok.apply_chat_template(
-            messages, tokenize=False, add_generation_prompt=True
-        )
-        input_ids = tok(prompt, return_tensors="pt").input_ids.to(DEVICE)
-        prompt_len = input_ids.shape[1]
+        rows = process_batch(model, tok, batch_examples, batch_indices)
+        for row in rows:
+            (correct_rows if row["is_correct"] else incorrect_rows).append(row)
+        total_processed += len(rows)
 
-        # Pass 1: extract layer-20 residual stream at last prompt token.
-        # hidden_states[0] = embedding output; hidden_states[k+1] = layer-k output.
-        with torch.no_grad():
-            fwd = model(input_ids, output_hidden_states=True, use_cache=False)
-        act_vec: np.ndarray = (
-            fwd.hidden_states[EXTRACT_LAYER + 1][0, -1, :]
-            .float()
-            .cpu()
-            .numpy()
-        )
-        del fwd
-
-        # Pass 2: generate the model's response.
-        with torch.no_grad():
-            out_ids = model.generate(
-                input_ids,
-                max_new_tokens=MAX_NEW_TOKENS,
-                do_sample=False,
-                pad_token_id=tok.eos_token_id,
-            )
-        response = tok.decode(out_ids[0, prompt_len:], skip_special_tokens=True)
-
-        correct = answers_match(response, gold)
-        row = {
-            "question": question,
-            "gold_answer": gold,
-            "model_response": response,
-            "is_correct": correct,
-            "activation_vector": act_vec,
-            "example_idx": i,
-        }
-        (correct_rows if correct else incorrect_rows).append(row)
-
-        if (i + 1) % 25 == 0:
-            done = len(correct_rows) + len(incorrect_rows)
-            acc = len(correct_rows) / done * 100
-            print(f"[{i + 1}/{len(ds)}]  acc={acc:.1f}%  "
-                  f"correct={len(correct_rows)}  incorrect={len(incorrect_rows)}")
+        done = len(correct_rows) + len(incorrect_rows)
+        acc = len(correct_rows) / done * 100
+        print(f"[{total_processed}/{len(ds)}]  acc={acc:.1f}%  "
+              f"correct={len(correct_rows)}  incorrect={len(incorrect_rows)}")
 
     total = len(correct_rows) + len(incorrect_rows)
     print(f"\nFinal: {len(correct_rows)}/{total} correct "
@@ -155,23 +206,22 @@ def main() -> None:
         acts = np.stack([r["activation_vector"] for r in rows]).astype(np.float32)
 
         table = pa.table({
-            "question":         pa.array([r["question"] for r in rows]),
-            "gold_answer":      pa.array([r["gold_answer"] for r in rows]),
-            "model_response":   pa.array([r["model_response"] for r in rows]),
-            "is_correct":       pa.array([r["is_correct"] for r in rows]),
+            "question":          pa.array([r["question"] for r in rows]),
+            "gold_answer":       pa.array([r["gold_answer"] for r in rows]),
+            "model_response":    pa.array([r["model_response"] for r in rows]),
+            "is_correct":        pa.array([r["is_correct"] for r in rows]),
             "activation_vector": pa.array(acts.tolist(), type=pa.list_(pa.float32())),
-            "example_idx":      pa.array([r["example_idx"] for r in rows],
-                                         type=pa.int32()),
+            "example_idx":       pa.array([r["example_idx"] for r in rows],
+                                          type=pa.int32()),
         })
 
         out_path = OUTPUT_DIR / f"{split}.parquet"
         pq.write_table(table, str(out_path))
         print(f"Saved {len(rows)} rows → {out_path}")
 
+
 # %%
 if __name__ == "__main__":
     main()
-
-# %%
 
 # %%
