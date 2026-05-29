@@ -1,0 +1,25 @@
+[project]
+name = "nla-thought-anchors"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+authors = [
+    { name = "Realmbird", email = "happychristopher777@gmail.com" }
+]
+requires-python = ">=3.11"
+dependencies = [
+    "accelerate>=1.13.0",
+    "httpx>=0.28.1",
+    "numpy>=2.4.6",
+    "orjson>=3.11.9",
+    "pyarrow>=24.0.0",
+    "pyyaml>=6.0.3",
+    "safetensors>=0.7.0",
+    "sglang[all]>=0.5.8.post1",
+    "torch>=2.9.1",
+    "transformers>=4.57.1",
+]
+
+[build-system]
+requires = ["uv_build>=0.11.1,<0.12.0"]
+build-backend = "uv_build"
