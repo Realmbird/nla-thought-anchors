@@ -1,1 +1,0 @@
-#uses nla ar to calc cos_sim to original prompt # 3
