@@ -28,14 +28,25 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 import torch
 
+from huggingface_hub import snapshot_download
+
 sys.path.insert(0, str(Path(__file__).parent))
 from inference import EXPLANATION_RE, NLAClient
+
+
+def resolve_local(repo_id_or_path: str) -> Path:
+    """Return a local directory path, downloading from HF Hub if needed."""
+    p = Path(repo_id_or_path)
+    if p.exists():
+        return p
+    print(f"Downloading {repo_id_or_path} from HuggingFace Hub ...")
+    return Path(snapshot_download(repo_id_or_path))
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
 # "parquet" → read PARQUET_DIR/*.parquet (one file per split)
 # "hf"      → stream from HF_REPO (each HF split becomes one output file)
-SOURCE = "parquet"
+SOURCE = "hf"
 PARQUET_DIR = Path("step1_activations")
 HF_REPO = "Realmbird/gsm8k-qwen2.5-7b-L20-activations"
 
@@ -76,6 +87,7 @@ def load_splits_hf(repo: str) -> dict[str, pa.Table]:
 def extract_vecs(table: pa.Table) -> np.ndarray:
     """activation_vector column (list<float32>) → float32 ndarray [N, d]."""
     flat = (table.column("activation_vector")
+            .combine_chunks()   # ChunkedArray → single ListArray before flatten
             .flatten()
             .to_numpy(zero_copy_only=False)
             .astype(np.float32))
@@ -144,8 +156,9 @@ async def verbalize_all(
 def main() -> None:
     OUTPUT_DIR.mkdir(exist_ok=True)
 
-    print(f"Loading NLAClient from {ACTOR_CHECKPOINT} ...")
-    client = NLAClient(ACTOR_CHECKPOINT, sglang_url=SGLANG_URL)
+    actor_dir = resolve_local(ACTOR_CHECKPOINT)
+    print(f"Loading NLAClient from {actor_dir} ...")
+    client = NLAClient(actor_dir, sglang_url=SGLANG_URL)
 
     print(f"Loading activation data (source={SOURCE!r}) ...")
     if SOURCE == "parquet":
