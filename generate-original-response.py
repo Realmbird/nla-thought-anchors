@@ -13,7 +13,9 @@ Each parquet has columns:
   model_response    string
   is_correct        bool
   activation_vector list<float32>  len=3584  — residual stream after layer 20,
-                                               last token of input prompt
+                                               at the #### token of the generated
+                                               response (last token of prompt as
+                                               fallback if #### not found)
   example_idx       int32
 
 Run:
@@ -38,12 +40,18 @@ MODEL_ID = "Qwen/Qwen2.5-7B-Instruct"
 EXTRACT_LAYER = 20          # residual stream after transformer layer 20 (0-indexed)
 D_MODEL = 3584
 MAX_NEW_TOKENS = 512
-OUTPUT_DIR = Path("step1_activations")
+
+# Where in the generated response to extract the activation:
+#   "hash"   — at the #### token (model has finished CoT, about to write answer)
+#   "answer" — one token after #### (first digit of the answer, answer is now in context)
+EXTRACT_POSITION = "answer"   # change to "answer" and OUTPUT_DIR to step1_answer for second run
+
+OUTPUT_DIR = Path(f"step1_activations_{EXTRACT_POSITION}")
 
 # Number of GSM8K test examples to process. None = all 1319.
 N_EXAMPLES: int | None = None
 
-# Batch size for forward + generate passes.
+# Batch size for generate + full-rollout forward passes.
 # 4× RTX 3090 (24 GB each): Qwen2.5-7B-Instruct in bfloat16 ≈ 14 GB on one GPU,
 # leaving ~10 GB for KV cache + activations. Start at 8; raise to 16 if VRAM allows.
 BATCH_SIZE = 8
@@ -90,9 +98,37 @@ def build_prompts(tok: AutoTokenizer, questions: list[str]) -> list[str]:
     ]
 
 
+def get_hash_token_id(tok: AutoTokenizer) -> int:
+    ids = tok.encode("####", add_special_tokens=False)
+    if len(ids) != 1:
+        print(f"[warn] '####' tokenizes to {len(ids)} tokens {ids}; "
+              f"using first token {ids[0]} to find extraction position")
+    return ids[0]
+
+
+def find_extract_position(
+    seq: torch.Tensor, hash_id: int, prompt_padded_len: int
+) -> int:
+    """Return extraction index based on EXTRACT_POSITION config.
+
+    "hash"   → position of #### token (model finished CoT, answer not yet written)
+    "answer" → one token after #### (first answer digit, answer now in context)
+    Falls back to last token if #### not found.
+    """
+    gen_part = seq[prompt_padded_len:]
+    positions = (gen_part == hash_id).nonzero(as_tuple=True)[0]
+    if len(positions) == 0:
+        return int(seq.shape[0] - 1)  # fallback
+    hash_pos = int(prompt_padded_len + positions[-1].item())
+    if EXTRACT_POSITION == "answer":
+        return min(hash_pos + 1, int(seq.shape[0] - 1))
+    return hash_pos  # "hash"
+
+
 def process_batch(
     model: AutoModelForCausalLM,
     tok: AutoTokenizer,
+    hash_id: int,
     batch_examples: list[dict],
     batch_indices: list[int],
 ) -> list[dict]:
@@ -100,27 +136,13 @@ def process_batch(
     golds = [ex["answer"] for ex in batch_examples]
     prompts = build_prompts(tok, questions)
 
-    # Left-pad so all sequences end at the same position — last real token is always [:, -1, :].
+    # Left-pad so all sequences end at the same position.
     enc = tok(prompts, return_tensors="pt", padding=True, truncation=False).to(DEVICE)
     input_ids = enc["input_ids"]
     attention_mask = enc["attention_mask"]
-    prompt_lens = attention_mask.sum(dim=1).tolist()  # actual (non-pad) lengths
+    prompt_padded_len = input_ids.shape[1]
 
-    # Pass 1: extract layer-20 residual stream at last prompt token.
-    # hidden_states[0] = embedding output; hidden_states[k+1] = layer-k output.
-    with torch.no_grad():
-        fwd = model(input_ids, attention_mask=attention_mask,
-                    output_hidden_states=True, use_cache=False)
-    # With left-padding the last real token is always at position -1.
-    act_vecs: np.ndarray = (
-        fwd.hidden_states[EXTRACT_LAYER + 1][:, -1, :]
-        .float()
-        .cpu()
-        .numpy()
-    )
-    del fwd
-
-    # Pass 2: generate responses.
+    # Pass 1: generate full responses.
     with torch.no_grad():
         out_ids = model.generate(
             input_ids,
@@ -130,13 +152,29 @@ def process_batch(
             pad_token_id=tok.eos_token_id,
         )
 
+    # Pass 2: forward on full rollout (prompt + response) with hidden states.
+    # Extend attention mask to cover generated tokens (all real, right-padded with eos).
+    gen_len = out_ids.shape[1] - prompt_padded_len
+    full_mask = torch.cat([
+        attention_mask,
+        torch.ones(len(batch_examples), gen_len, dtype=torch.long, device=DEVICE),
+    ], dim=1)
+
+    torch.cuda.empty_cache()
+    with torch.no_grad():
+        fwd = model(out_ids, attention_mask=full_mask,
+                    output_hidden_states=True, use_cache=False)
+    hidden = fwd.hidden_states[EXTRACT_LAYER + 1]  # [B, total_len, d_model]
+    del fwd
+
     rows = []
-    for b, (question, gold, idx, act_vec, plen) in enumerate(
-        zip(questions, golds, batch_indices, act_vecs, prompt_lens)
-    ):
-        total_len = input_ids.shape[1]
-        # out_ids includes the (left-padded) prompt; skip it to get only new tokens.
-        response = tok.decode(out_ids[b, total_len:], skip_special_tokens=True)
+    for b, (question, gold, idx) in enumerate(zip(questions, golds, batch_indices)):
+        response = tok.decode(out_ids[b, prompt_padded_len:], skip_special_tokens=True)
+
+        # Extract at the #### token — the model has finished all reasoning there.
+        pos = find_extract_position(out_ids[b], hash_id, prompt_padded_len)
+        act_vec = hidden[b, pos, :].float().cpu().numpy()
+
         rows.append({
             "question": question,
             "gold_answer": gold,
@@ -160,9 +198,12 @@ def main() -> None:
     if tok.pad_token is None:
         tok.pad_token = tok.eos_token
 
+    hash_id = get_hash_token_id(tok)
+    print(f"#### token id: {hash_id}")
+
     model = AutoModelForCausalLM.from_pretrained(
         MODEL_ID,
-        torch_dtype=DTYPE,
+        dtype=DTYPE,
         device_map="auto",
         trust_remote_code=True,
     )
@@ -183,7 +224,7 @@ def main() -> None:
         batch_examples = [ds[i] for i in range(batch_start, batch_end)]
         batch_indices = list(range(batch_start, batch_end))
 
-        rows = process_batch(model, tok, batch_examples, batch_indices)
+        rows = process_batch(model, tok, hash_id, batch_examples, batch_indices)
         for row in rows:
             (correct_rows if row["is_correct"] else incorrect_rows).append(row)
         total_processed += len(rows)
