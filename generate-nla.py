@@ -46,14 +46,18 @@ def resolve_local(repo_id_or_path: str) -> Path:
 
 # "parquet" → read PARQUET_DIR/*.parquet (one file per split)
 # "hf"      → stream from HF_REPO (each HF split becomes one output file)
-SOURCE = "hf"
-PARQUET_DIR = Path("step1_activations")
+# "hash"   → activations at #### token (step1_activations_hash/)
+# "answer" → activations at answer token (step1_activations_answer/)
+EXTRACT_POSITION = "hash"
+
+SOURCE = "parquet"   # "parquet" or "hf"
+PARQUET_DIR = Path(f"step1_activations_{EXTRACT_POSITION}")
 HF_REPO = "Realmbird/gsm8k-qwen2.5-7b-L20-activations"
 
 ACTOR_CHECKPOINT = "kitft/nla-qwen2.5-7b-L20-av"   # HF repo; downloaded on first run
 CRITIC_CHECKPOINT = "kitft/nla-qwen2.5-7b-L20-ar"  # optional — for round-trip MSE scoring
 SGLANG_URL = "http://localhost:30000"
-OUTPUT_DIR = Path("step2_nla")
+OUTPUT_DIR = Path(f"step2_nla_{EXTRACT_POSITION}")
 
 # None = all examples; set to e.g. 50 for a quick test run
 N_EXAMPLES: int | None = None
